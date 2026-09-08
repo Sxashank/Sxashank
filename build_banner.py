@@ -58,53 +58,67 @@ def generate_logo_points(text, num_points):
 
 def build_svg(theme):
     pal = PALETTE[theme]
+from PIL import ImageOps
+import sys
+
+def process_portrait(src_path, theme, pal):
+    from rembg import remove
+    print("Removing background for a clean portrait...")
+    src = Image.open(src_path).convert("RGBA")
     
-    # Process image
-    src = Image.open("source-photo.png").convert("RGBA")
-    # Crop to a nice head-and-shoulders ratio before shrinking
-    w, h = src.size
-    # let's try a 300x340 aspect ratio crop from the center
+    # 1. Remove background completely to remove static noise
+    subject_only = remove(src)
+
+    w, h = subject_only.size
     target_aspect = 300 / 340
     current_aspect = w / h
+    
     if current_aspect > target_aspect:
-        # crop width
         new_w = int(h * target_aspect)
         left = (w - new_w) // 2
-        src = src.crop((left, 0, left + new_w, h))
+        subject_only = subject_only.crop((left, 0, left + new_w, h))
     else:
-        # crop height
         new_h = int(w / target_aspect)
         top = (h - new_h) // 2
-        src = src.crop((0, top, w, top + new_h))
+        subject_only = subject_only.crop((0, top, w, top + new_h))
 
-    # create white bg for dark mode segmentation / light mode
-    bg = Image.new("RGBA", src.size, (255, 255, 255, 255))
-    comp = Image.alpha_composite(bg, src).convert("L")
+    # Resize to higher resolution for clearer image (250x283)
+    subject_only = subject_only.resize((250, 283), Image.LANCZOS)
     
-    # Contrast & Crop & Resize
-    comp = comp.resize((150, 170), Image.LANCZOS) # using 150x170 to keep file size reasonable for now
-    from PIL import ImageOps
+    # Isolate the alpha channel so we ONLY draw where the person actually is
+    alpha = np.array(subject_only.split()[-1])
+    
+    # Composite onto white to get correct shading levels
+    white_bg = Image.new("RGBA", subject_only.size, (255, 255, 255, 255))
+    comp = Image.alpha_composite(white_bg, subject_only).convert("L")
+    
     comp = ImageOps.autocontrast(comp, cutoff=1)
-    
-    enhancer = ImageEnhance.Contrast(comp)
-    comp = enhancer.enhance(1.3)
+    comp = ImageEnhance.Contrast(comp).enhance(1.3)
     comp = comp.filter(ImageFilter.UnsharpMask(radius=3, percent=140))
     
     dithered = floyd_steinberg_dither(comp)
     
-    # For dark mode, dots should draw the subject (white parts of dither against dark bg)
-    # For light mode, dots should draw the shadow (black parts of dither against light bg)
-    if theme == "dark":
-        y_idx, x_idx = np.where(~dithered) # In source-prepped, background is white, so ~dithered (black) is the subject
-    else:
-        y_idx, x_idx = np.where(~dithered)
+    svg_paths = []
+    # y = rows, x = cols
+    arr = dithered
+    for y in range(arr.shape[0]):
+        for x in range(arr.shape[1]):
+            # Only draw a dot if it is inside the alpha mask (the person)
+            if alpha[y, x] > 128: 
+                # Dark mode: draw the light parts (white dots)
+                # Light mode: draw the dark parts (black dots)
+                draw_dot = not arr[y, x] if theme == "light" else arr[y, x]
+                if draw_dot:
+                    # scale points to fit the 300x340 visual map box
+                    sx = (x * 1.2) + 60
+                    sy = (y * 1.2) + 100
+                    # using smaller dots (1.5x1) for higher detail
+                    svg_paths.append(f"M{sx:.1f},{sy:.1f}h1v1h-1Z")
+    
+    return "".join(svg_paths)
 
-    pts = np.column_stack((x_idx, y_idx))
-    # scale points to fit visual map panel
-    # We resized to 150x170. We want it to fill 300x340 space. Scale by 2.
-    pts = pts * 2
-    pts[:, 0] = pts[:, 0] + 90
-    pts[:, 1] = pts[:, 1] + 130
+def build_svg(theme):
+    pal = PALETTE[theme]
     
     svg = []
     svg.append(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W_SVG} {H_SVG}" width="{W_SVG}" height="{H_SVG}">')
@@ -122,7 +136,6 @@ def build_svg(theme):
     def add_row(label, val):
         nonlocal y_text
         svg.append(f'<text x="500" y="{y_text}" fill="{pal["chrome"]}" font-family="monospace" font-size="16">{label}</text>')
-        # add dotted leader
         dots = "." * max(1, 40 - len(label) - len(val))
         svg.append(f'<text x="{520 + len(label)*10}" y="{y_text}" fill="{pal["chrome"]}" opacity="0.3" font-family="monospace" font-size="16">{dots}</text>')
         svg.append(f'<text x="1100" y="{y_text}" fill="{pal["chrome"]}" font-family="monospace" font-size="16" text-anchor="end">{val}</text>')
@@ -138,14 +151,13 @@ def build_svg(theme):
     add_row("OS", OS_NAME)
     add_row("Shell", SHELL)
     
-    # Draw paths
-    paths = []
-    # Removed the downsampling!
-    for x, y in pts:
-        paths.append(f"M{x},{y}h2v2h-2Z")
-        
-    svg.append(f'<path d="{"".join(paths)}" fill="{pal["portrait"]}" shape-rendering="crispEdges"/>')
+    # Map dots
+    paths = process_portrait("source-photo.png", theme, pal)
+    svg.append(f'<path d="{paths}" fill="{pal["portrait"]}" shape-rendering="crispEdges"/>')
     svg.append('</svg>')
+    
+    with open(f"{theme}.svg", "w") as f:
+        f.write("\n".join(svg))
     
     with open(f"{theme}.svg", "w") as f:
         f.write("\n".join(svg))
